@@ -16,6 +16,7 @@
 */
 
 #include <cmath>
+#include <filesystem>
 #include "cad_sdk.h"
 #include "Plugin.h"
 
@@ -28,10 +29,18 @@ const GUID ORDER_SHUFFLE_TRACKS = { 0xC5CF4A57, 0x8C01, 0x480C, { 0xB3, 0x34, 0x
 const GUID ORDER_SHUFFLE_ALBUMS = { 0x499E0B08, 0xC887, 0x48C1, { 0x9C, 0xCA, 0x27, 0x37, 0x7C, 0x8B, 0xFD, 0x30 } }; // {499E0B08-C887-48C1-9CCA-27377C8BFD30}
 const GUID ORDER_SHUFFLE_DIRECTORIES = { 0x83C37600, 0xD725, 0x4727, { 0xB5, 0x3C, 0xBD, 0xEF, 0xFE, 0x5F, 0x8D, 0xC7 } }; // {83C37600-D725-4727-B53C-BDEFFE5F8DC7}
 
-DECLARE_COMPONENT_VERSION(
-	"CD Art Display",
-	"1.0.3",
-	"© 2013 - Birunthan Mohanathas");
+DECLARE_COMPONENT_VERSION("CAD NowPlaying", "1.0.3.2",
+"Adds RainMeter CAD NowPlaying support\n"
+"Module: foo_cad_nowplaying\n"
+"Version: 1.0.3.2\n"
+"Compiled: "__DATE__"\n"
+"Mod by DaYuyu\n"
+"foo_cad_nowplaying repo: https://github.com/ghDaYuYu/foo_cad_nowplaying\n\n"
+"Original component: foo_cad by Birunthan Mohanathas\n"
+"foo_cad repo: https://github.com/poiru/foo-cad\n\n"
+"Copyright (C) 2013 - Birunthan Mohanathas\n");
+
+VALIDATE_COMPONENT_FILENAME("foo_cad_nowplaying.dll");
 
 static initquit_factory_t<foo_cad> foo_interface;
 
@@ -133,6 +142,58 @@ void foo_cad::on_playback_stop(play_control::t_stop_reason reason)
 	}
 }
 
+bool HasImageExtension(pfc::string8 extension) {
+	const std::vector<pfc::string8> vext{ ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff" };
+	return std::find(vext.begin(), vext.end(), extension) != vext.end();
+}
+
+void GetArtFullFilePath(const metadb_handle_ptr& track, pfc::string8& filepath, bool& bimgEmbedded) {
+	static_api_ptr_t<album_art_manager_v2> aam;
+	abort_callback_impl abort;
+	try {
+
+		auto extractor = aam->open(
+			pfc::list_single_ref_t(track),
+			pfc::list_single_ref_t(album_art_ids::cover_front), abort);
+
+		album_art_path_list::ptr qp;
+		bool bArtwork = false;
+
+		try {
+			qp = extractor->query_paths(album_art_ids::cover_front, abort);
+			bArtwork = true;
+		}
+		catch (const exception_album_art_not_found&) {
+			//..
+		}
+
+		if (!bArtwork) {
+			// exit
+			return;
+		}
+
+		pfc::string8 strPicturePath;
+
+		if (qp.get_ptr()) {
+
+			strPicturePath = qp->get_path(0);
+			auto u8picPath = std::filesystem::u8path(strPicturePath.c_str());
+			auto picExtension = u8picPath.extension();
+
+			if (!HasImageExtension(picExtension.string().c_str())) {
+				bimgEmbedded = true;
+				filepath = "";
+			}
+			else {
+				filepath = strPicturePath;
+			}
+		}
+	}
+	catch (const exception_aborted&) {
+		return;
+	}
+}
+
 void foo_cad::on_playback_pause(bool state)
 {
 	if (!m_cad_window) return;
@@ -144,12 +205,24 @@ void foo_cad::on_playback_new_track(metadb_handle_ptr track)
 {
 	if (!m_cad_window) return;
 
+	pfc::string8 trkFullPath;
+	bool bEmbbeded = false;
+	GetArtFullFilePath(track, trkFullPath, bEmbbeded);
+
 	service_ptr_t<titleformat_object> script;
-	pfc::string8 format = "[%title%]\t[%artist%]\t[%album%]\t\t$year(%date%)\t\t$num(%tracknumber%,0)\t%length_seconds%\t%path%\t$mul($min($max(0,%rating%),5),2)\t \t\t\t\t\t\t\t";
+	pfc::string8 format;
+	if (bEmbbeded || !trkFullPath.get_length()) {
+		format = "[%title%]\t[%artist%]\t[%album%]\t\t$year(%date%)\t\t$num(%tracknumber%,0)\t%length_seconds%\t%path%\t$mul($min($max(0,%rating%),5),2)\t \t\t\t\t\t\t\t";
+	}
+	else {
+		format = "[%title%]\t[%artist%]\t[%album%]\t\t$year(%date%)\t\t$num(%tracknumber%,0)\t%length_seconds%\t%path%\t$mul($min($max(0,%rating%),5),2)";
+	}
 
 	if (static_api_ptr_t<titleformat_compiler>()->compile(script, format))
 	{
 		static_api_ptr_t<playback_control> pbc;
+
+		PostMessage(m_cad_window, WM_USER, pbc->is_paused() ? PS_PAUSED : pbc->is_playing() ? PS_PLAYING : PS_STOPPED, PM_STATECHANGED);
 
 		pbc->playback_format_title_ex(
 			track,
@@ -159,8 +232,18 @@ void foo_cad::on_playback_new_track(metadb_handle_ptr track)
 			nullptr,
 			playback_control::display_level_titles);
 
+		if (!bEmbbeded && trkFullPath.get_length()) {
+
+			trkFullPath = trkFullPath.replace("file://", "");
+			auto u8picPath = std::filesystem::u8path(trkFullPath.c_str());
+
+			format << "\t";
+			format << u8picPath.generic_u8string().c_str();
+			format << "\t\t\t\t\t\t\t";
+		}
+
 		WCHAR buffer[2048];
-		int len = MultiByteToWideChar(CP_UTF8, 0, format.get_ptr(), format.get_length() + 1, buffer, _countof(buffer));
+		int len = MultiByteToWideChar(CP_UTF8, 0, format.get_ptr(), static_cast<int>(format.get_length() + 1), buffer, _countof(buffer));
 
 		COPYDATASTRUCT cds;
 		cds.dwData = PM_TRACKDATA;
@@ -205,6 +288,12 @@ void foo_cad::register_cad(HWND cad)
 		cds.cbData = (len + 1) * sizeof(WCHAR);
 		SendMessage(m_cad_window, WM_COPYDATA, (WPARAM)m_window, (LPARAM)&cds);
 	}
+
+	if (m_cad_window) {
+			static_api_ptr_t<playback_control> pbc;
+			PostMessage(m_cad_window, WM_USER, pbc->is_paused() ? PS_PAUSED : pbc->is_playing() ? PS_PLAYING : PS_STOPPED, PM_STATECHANGED);
+	}
+
 };
 
 LRESULT CALLBACK foo_cad::window_proc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
